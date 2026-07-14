@@ -41,6 +41,78 @@ safe_sed() {
         xargs -r sed -i "s|$pattern|$replacement|g"
 }
 
+# --- Helper: fetch Personal configs from x86_64 Personal .deb ---
+# Downloads the latest x86_64 Personal build and extracts oem.ini + product.dat
+# for use as reference config on the ARM64 365 build.
+fetch_personal_configs() {
+    local outdir="$1"
+    mkdir -p "$outdir"
+
+    log "Fetching x86_64 Personal version info..."
+    local personal_deb_url
+    personal_deb_url=$(curl -sL 'https://linux.wps.cn' 2>/dev/null | \
+        grep -Po "(?<=['\"])http[^'\"]+_amd64\.deb(?=['\"])" | sort -u | head -1)
+
+    if [[ -z "$personal_deb_url" ]]; then
+        warn "Could not determine Personal download URL. Skipping config fetch."
+        return 1
+    fi
+
+    local personal_deb_file="$SCRIPT_DIR/$(basename "$personal_deb_url")"
+    local extract_dir
+    extract_dir="$(mktemp -d -p "$HOME" -t wps-personal-XXXXXX)"
+
+    if [[ ! -f "$personal_deb_file" ]]; then
+        log "Downloading Personal .deb: $(basename "$personal_deb_url")"
+        if ! retry curl -fL --retry 3 --retry-delay 5 -o "$personal_deb_file" "$personal_deb_url"; then
+            warn "Failed to download Personal .deb."
+            rm -rf "$extract_dir"
+            return 1
+        fi
+    else
+        log "Using cached Personal .deb: $(basename "$personal_deb_url")"
+    fi
+
+    (cd "$extract_dir" && ar x "$personal_deb_file" 2>/dev/null)
+    if [[ -f "$extract_dir/data.tar.xz" ]]; then
+        bsdtar -xpf "$extract_dir/data.tar.xz" -C "$extract_dir" 2>/dev/null
+    elif [[ -f "$extract_dir/data.tar.zst" ]]; then
+        bsdtar --zstd -xpf "$extract_dir/data.tar.zst" -C "$extract_dir" 2>/dev/null
+    elif [[ -f "$extract_dir/data.tar.gz" ]]; then
+        bsdtar -xpf "$extract_dir/data.tar.gz" -C "$extract_dir" 2>/dev/null
+    else
+        warn "No data archive found in Personal .deb."
+        rm -rf "$extract_dir"
+        return 1
+    fi
+
+    local src_cfgs="$extract_dir/opt/kingsoft/wps-office/office6/cfgs"
+    if [[ ! -d "$src_cfgs" ]]; then
+        warn "Personal .deb has unexpected structure (no office6/cfgs)."
+        rm -rf "$extract_dir"
+        return 1
+    fi
+
+    # Copy config files
+    local copied=0
+    for f in oem.ini product.dat product_new.dat; do
+        if [[ -f "$src_cfgs/$f" ]]; then
+            cp -a "$src_cfgs/$f" "$outdir/$f"
+            log "  Fetched Personal config: $f ($(du -h "$outdir/$f" | cut -f1))"
+            ((copied++))
+        fi
+    done
+
+    rm -rf "$extract_dir"
+    log "Fetched $copied Personal config file(s) to $outdir"
+    return $(( copied > 0 ? 0 : 1 ))
+}
+
+# Optional: fetch Personal config files from x86_64 Personal .deb
+# Set FETCH_PERSONAL_CONFIGS=1 to enable (requires curl + ar + bsdtar)
+FETCH_PERSONAL_CONFIGS="${FETCH_PERSONAL_CONFIGS:-0}"
+PERSONAL_EXTRACT_DIR=""
+
 # =====================================================================
 #  0.  Verify environment
 # =====================================================================
@@ -55,6 +127,9 @@ done
 
 log "Work dir: $WORKDIR"
 log "Max parallel jobs: $MAX_JOBS"
+if (( FETCH_PERSONAL_CONFIGS )); then
+    log "FETCH_PERSONAL_CONFIGS enabled — will attempt to merge Personal configs"
+fi
 
 # =====================================================================
 #  1.  Download (with resume, multi-source if aria2c available)
@@ -220,9 +295,139 @@ else
 fi
 
 # =====================================================================
+#  4c.  Personal edition activation & config verification bypass
+# =====================================================================
+log "Setting up personal edition patches..."
+
+# --- Activation code ---
+# Well-tested method: write the known activation code and make it read-only
+# so WPS cannot overwrite it when the trial expires.
+AUTH_DIR="$PKGROOT/opt/kingsoft/.auth"
+mkdir -p "$AUTH_DIR"
+printf '694BF-YUDBG-EAR69-BPRGB-ATQXH' > "$AUTH_DIR/license2.dat"
+chmod 444 "$AUTH_DIR/license2.dat"
+log "Activation code installed at $AUTH_DIR/license2.dat (read-only)"
+
+# --- Config signature verification bypass (LD_PRELOAD) ---
+# Ships a small C source that hooks known verification functions.
+# Compiled at build time if gcc is available; otherwise user compiles later.
+BYPASS_DIR="$PKGROOT/usr/lib/office6"
+
+cat > "$BYPASS_DIR/libwpspatch.c" << 'BYPASS_EOF'
+/*
+ * WPS Office config signature verification bypass for ARM64 Linux.
+ * LD_PRELOAD library that hooks known verification functions.
+ *
+ * Compile:
+ *   gcc -shared -fPIC -o libwpspatch.so libwpspatch.c -ldl
+ *
+ * Usage:
+ *   LD_PRELOAD=/usr/lib/office6/libwpspatch.so wps
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <string.h>
+#include <dlfcn.h>
+
+/* Hook: ks_check_oem_ini_signature(const char* path) -> int (0 = valid) */
+int ks_check_oem_ini_signature(const char* path) {
+    fprintf(stderr, "[libwpspatch] Bypassed oem.ini signature check\n");
+    return 0;
+}
+
+/* Hook: check_oem_ini_hash(const char* path, void* unused) -> int */
+int check_oem_ini_hash(const char* path, void* unused) {
+    fprintf(stderr, "[libwpspatch] Bypassed oem.ini hash check\n");
+    return 0;
+}
+
+/* Hook: verify_profile_integrity(const char* path) -> int */
+int verify_profile_integrity(const char* path) {
+    fprintf(stderr, "[libwpspatch] Bypassed profile integrity check\n");
+    return 0;
+}
+
+/* Hook: ks_product_dat_verify(const char* path) -> int */
+int ks_product_dat_verify(const char* path) {
+    fprintf(stderr, "[libwpspatch] Bypassed product.dat verification\n");
+    return 0;
+}
+BYPASS_EOF
+
+if command -v gcc &>/dev/null; then
+    log "Compiling config verification bypass library for aarch64..."
+    if gcc -shared -fPIC -o "$BYPASS_DIR/libwpspatch.so" \
+           "$BYPASS_DIR/libwpspatch.c" -ldl \
+           2>/tmp/wps-bypass-build.log; then
+        local sz=$(du -k "$BYPASS_DIR/libwpspatch.so" | cut -f1)
+        chmod 644 "$BYPASS_DIR/libwpspatch.so"
+        log "Bypass library compiled: libwpspatch.so (${sz} KB)"
+    else
+        warn "Failed to compile bypass library (see /tmp/wps-bypass-build.log)."
+        warn "Shipping source only; user can compile manually."
+        rm -f "$BYPASS_DIR/libwpspatch.so"
+    fi
+else
+    warn "gcc not found — shipping bypass source only."
+    warn "Compile on target: gcc -shared -fPIC -o /usr/lib/office6/libwpspatch.so /usr/lib/office6/libwpspatch.c -ldl"
+fi
+
+# --- Modify wrapper scripts to preload the bypass library ---
+log "Adding conditional bypass preload to wrapper scripts..."
+for wrapper in "$PKGROOT"/usr/bin/wps "$PKGROOT"/usr/bin/wpp "$PKGROOT"/usr/bin/et; do
+    if [[ -f "$wrapper" ]]; then
+        sed -i '/^export LD_PRELOAD=/a if [ -f /usr/lib/office6/libwpspatch.so ]; then export LD_PRELOAD="/usr/lib/office6/libwpspatch.so:$LD_PRELOAD"; fi' "$wrapper"
+        log "  Patched: $wrapper"
+    fi
+done
+
+# --- (Optional) Fetch and apply Personal config files ---
+# When FETCH_PERSONAL_CONFIGS=1, downloads the x86_64 Personal .deb and
+# extracts oem.ini / product.dat / product_new.dat into the package.
+# These override the 365 defaults and may unlock Personal features.
+# NOTE: If the cipher format differs between versions, the LD_PRELOAD
+# bypass above must intercept the verification, or WPS will reject them.
+if (( FETCH_PERSONAL_CONFIGS )); then
+    log "FETCH_PERSONAL_CONFIGS is enabled — fetching Personal configs..."
+    PERSONAL_EXTRACT_DIR="$(mktemp -d -p "$HOME" -t wps-personal-config-XXXXXX)"
+    if fetch_personal_configs "$PERSONAL_EXTRACT_DIR"; then
+        CFGS_DST="$PKGROOT/usr/lib/office6/cfgs"
+        for f in "$PERSONAL_EXTRACT_DIR"/*; do
+            if [[ -f "$f" ]]; then
+                cp -a "$f" "$CFGS_DST/"
+                log "  Applied Personal config: $(basename "$f")"
+            fi
+        done
+    else
+        warn "Failed to fetch Personal configs. Continuing with 365 defaults."
+    fi
+else
+    log "Skipping Personal config fetch (set FETCH_PERSONAL_CONFIGS=1 to enable)."
+fi
+
+# =====================================================================
 #  5.  Generate RPM spec
 # =====================================================================
 log "Generating RPM spec..."
+
+# Build %files list (conditional on whether .so was compiled)
+FILES_LIST='/usr/lib/office6
+/usr/bin/*
+/usr/share/applications/*
+/usr/share/icons/*
+/usr/share/mime/*
+/usr/share/fonts/wps-office/*
+/usr/share/desktop-directories/*
+/etc/fonts/conf.avail/40-wps-office.conf
+/etc/xdg/menus/applications-merged/wps-office.menu
+/opt/kingsoft/.auth/license2.dat
+/usr/lib/office6/libwpspatch.c'
+
+if [[ -f "$BYPASS_DIR/libwpspatch.so" ]]; then
+    FILES_LIST="$FILES_LIST
+/usr/lib/office6/libwpspatch.so"
+fi
+
 cat > "$BUILDROOT/SPECS/wps-office-cn.spec" <<EOF
 Name:           wps-office-cn
 Version:        ${PKGVER//-/_}
@@ -240,27 +445,31 @@ Conflicts:      kingsoft-office, wps-office
 Kingsoft Office (WPS Office) CN version, repackaged as an RPM for Fedora aarch64
 from the official 365/international arm64 deb build.
 
+Includes personal edition activation patch (activation code + config
+verification bypass via LD_PRELOAD).
+
 %install
 mkdir -p %{buildroot}
 cp -a ${PKGROOT}/usr %{buildroot}/
 cp -a ${PKGROOT}/etc %{buildroot}/
+cp -a ${PKGROOT}/opt %{buildroot}/ 2>/dev/null || :
 
 %files
-/usr/lib/office6
-/usr/bin/*
-/usr/share/applications/*
-/usr/share/icons/*
-/usr/share/mime/*
-/usr/share/fonts/wps-office/*
-/usr/share/desktop-directories/*
-/etc/fonts/conf.avail/40-wps-office.conf
-/etc/xdg/menus/applications-merged/wps-office.menu
+${FILES_LIST}
 
 %post
 update-mime-database /usr/share/mime &>/dev/null || :
 update-desktop-database &>/dev/null || :
 ln -sf /etc/fonts/conf.avail/40-wps-office.conf /etc/fonts/conf.d/40-wps-office.conf &>/dev/null || :
 fc-cache -f &>/dev/null || :
+
+# Personal edition: keep activation code read-only
+chmod 444 /opt/kingsoft/.auth/license2.dat 2>/dev/null || :
+
+# Attempt to compile bypass on target if missing (e.g. after upgrade)
+if [ ! -f /usr/lib/office6/libwpspatch.so ] && command -v gcc &>/dev/null && [ -f /usr/lib/office6/libwpspatch.c ]; then
+    gcc -shared -fPIC -o /usr/lib/office6/libwpspatch.so /usr/lib/office6/libwpspatch.c -ldl 2>/dev/null || :
+fi
 
 %postun
 update-mime-database /usr/share/mime &>/dev/null || :
@@ -294,6 +503,8 @@ if (( BUILD_EXIT == 0 )); then
         rpm -qlp "$RPM_PATH" | grep -q '/usr/bin/wps'          || { warn "Missing /usr/bin/wps";          ((MISSING++)); }
         rpm -qlp "$RPM_PATH" | grep -q 'zh_CN'                 || { warn "Missing zh_CN localization";    ((MISSING++)); }
         rpm -qlp "$RPM_PATH" | grep -q '/etc/fonts/conf.avail' || { warn "Missing font config";           ((MISSING++)); }
+        rpm -qlp "$RPM_PATH" | grep -q 'libwpspatch.c'         || { warn "Missing bypass source (libwpspatch.c)"; ((MISSING++)); }
+        rpm -qlp "$RPM_PATH" | grep -q 'license2.dat'          || { warn "Missing activation code (license2.dat)"; ((MISSING++)); }
 
         if (( MISSING == 0 )); then
             log "All expected files present in RPM."
