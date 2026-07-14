@@ -1,2 +1,7 @@
 build/
 .idea/
+*.deb
+*.lock
+*.metadata.json
+*.resolved
+*.resolved.*

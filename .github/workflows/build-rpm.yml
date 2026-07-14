@@ -1,0 +1,43 @@
+name: Build RPM (Fedora aarch64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      wps_version:
+        description: 'WPS version override (e.g. 12.1.2.26885) — leave empty for default'
+        required: false
+        default: ''
+      fedora_version:
+        description: 'Fedora release'
+        required: false
+        default: '42'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build RPM in native Fedora ARM64 container
+        run: |
+          mkdir -p "${{ github.workspace }}/output"
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace:ro" \
+            -v "${{ github.workspace }}/output:/output" \
+            -w /workspace \
+            fedora:${{ inputs.fedora_version }} \
+            bash -c "
+              set -eux
+              dnf install -y binutils bsdtar rpm-build findutils
+              if [ -n '${{ inputs.wps_version }}' ]; then
+                sed -i 's/^PKGVER=\".*\"/PKGVER=\"${{ inputs.wps_version }}\"/' install-fedora.sh
+              fi
+              bash install-fedora.sh
+              find /root/rpmbuild -name '*.rpm' -exec cp {} /output/ \;
+            "
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wps-office-cn-fedora${{ inputs.fedora_version }}-aarch64
+          path: ${{ github.workspace }}/output/*.rpm

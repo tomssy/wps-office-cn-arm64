@@ -1,0 +1,20 @@
+post_install() {
+  update-mime-database /usr/share/mime &>/dev/null || true
+  update-desktop-database &>/dev/null || true
+  ln -sf /etc/fonts/conf.avail/40-wps-office.conf /etc/fonts/conf.d/40-wps-office.conf &>/dev/null || true
+  fc-cache -f &>/dev/null || true
+}
+
+post_upgrade() {
+  post_install
+}
+
+pre_remove() {
+  rm -f /etc/fonts/conf.d/40-wps-office.conf &>/dev/null || true
+}
+
+post_remove() {
+  update-mime-database /usr/share/mime &>/dev/null || true
+  update-desktop-database &>/dev/null || true
+  fc-cache -f &>/dev/null || true
+}
