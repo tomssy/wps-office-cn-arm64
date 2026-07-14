@@ -22,9 +22,10 @@ jobs:
         run: |
           mkdir -p "${{ github.workspace }}/output"
           docker run --rm \
-            -v "${{ github.workspace }}:/workspace:ro" \
+            -v "${{ github.workspace }}:/workspace" \
             -v "${{ github.workspace }}/output:/output" \
             -w /workspace \
+            -e HOME=/root \
             fedora:${{ inputs.fedora_version }} \
             bash -c "
               set -eux
@@ -32,6 +33,7 @@ jobs:
               if [ -n '${{ inputs.wps_version }}' ]; then
                 sed -i 's/^PKGVER=\".*\"/PKGVER=\"${{ inputs.wps_version }}\"/' install-fedora.sh
               fi
+              mkdir -p /root/rpmbuild
               bash install-fedora.sh
               find /root/rpmbuild -name '*.rpm' -exec cp {} /output/ \;
             "
