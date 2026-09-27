@@ -29,6 +29,7 @@ jobs:
             ubuntu:${{ inputs.ubuntu_version }} \
             bash -c "
               set -eux
+              apt update
               apt install -y binutils libarchive-tools dpkg-dev fakeroot findutils
               if [ -n '${{ inputs.wps_version }}' ]; then
                 sed -i 's/^PKGVER=\".*\"/PKGVER=\"${{ inputs.wps_version }}\"/' install-ubuntu.sh
