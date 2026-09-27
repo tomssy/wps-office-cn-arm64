@@ -1,0 +1,45 @@
+name: Build DEB (UBUNTU aarch64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      wps_version:
+        description: 'WPS version override (e.g. 12.1.2.26885) — leave empty for default'
+        required: false
+        default: ''
+      ubuntu_version:
+        description: 'Ubuntu release'
+        required: false
+        default: '24.04'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build RPM in native Fedora ARM64 container
+        run: |
+          mkdir -p "${{ github.workspace }}/output"
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -v "${{ github.workspace }}/output:/output" \
+            -w /workspace \
+            -e HOME=/root \
+            ubuntu:${{ inputs.ubuntu_version }} \
+            bash -c "
+              set -eux
+              apt install -y binutils libarchive-tools dpkg-dev fakeroot findutils
+              if [ -n '${{ inputs.wps_version }}' ]; then
+                sed -i 's/^PKGVER=\".*\"/PKGVER=\"${{ inputs.wps_version }}\"/' install-ubuntu.sh
+              fi
+              mkdir -p /root/wps-repack
+              bash install-ubuntu.sh
+              find /root/wps-repack -name '*.deb' -exec cp {} /output/ \;
+            "
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wps-office-cn-ubuntu${{ inputs.ubuntu_version }}-aarch64
+          path: ${{ github.workspace }}/output/*.deb
