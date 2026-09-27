@@ -16,9 +16,9 @@ jobs:
   build:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Build RPM in native Fedora ARM64 container
+      - name: Build DEB in native ubuntu ARM64 container
         run: |
           mkdir -p "${{ github.workspace }}/output"
           docker run --rm \
